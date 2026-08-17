@@ -187,6 +187,13 @@ class MPSGELU(nn.Module):
         return nn.functional.gelu(x, approximate=self.approximate)
 
 
+class WanFeedForward(nn.Sequential):
+    """[Linear, GELU(tanh), Linear], with the GELU folded into the down-projection."""
+
+    def forward(self, x):
+        return comfy.ops.linear_input_act(self[2], self[0](x), "gelu_tanh")
+
+
 def _adaln(shift, x, scale):
     """AdaLN: shift + x * (1 + scale), MPS fp32-safe (avoids (1+scale) catastrophic cancellation)."""
     if x.device.type == "mps":

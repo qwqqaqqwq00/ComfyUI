@@ -716,6 +716,40 @@ def freqs_cis_matrix(freqs, pad_size, split_mode, num_attention_heads, out_dtype
     )
     return rotation_matrix.reshape(*rotation_matrix.shape[:-1], 2, 2), split_mode
 
+
+def interleaved_freqs_cis(freqs, pad_size):
+    """Compatibility shim for ComfyUI-LTXVideo (renamed to freqs_cis_matrix in 0.33)."""
+    cos_freq = freqs.cos().repeat_interleave(2, dim=-1)
+    sin_freq = freqs.sin().repeat_interleave(2, dim=-1)
+    if pad_size != 0:
+        cos_padding = torch.ones_like(cos_freq[:, :, : pad_size])
+        sin_padding = torch.zeros_like(cos_freq[:, :, : pad_size])
+        cos_freq = torch.cat([cos_padding, cos_freq], dim=-1)
+        sin_freq = torch.cat([sin_padding, sin_freq], dim=-1)
+    return cos_freq, sin_freq
+
+
+def split_freqs_cis(freqs, pad_size, num_attention_heads):
+    """Compatibility shim for ComfyUI-LTXVideo (renamed to freqs_cis_matrix in 0.33)."""
+    cos_freq = freqs.cos()
+    sin_freq = freqs.sin()
+
+    if pad_size != 0:
+        cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
+        sin_padding = torch.zeros_like(sin_freq[:, :, :pad_size])
+
+        cos_freq = torch.concatenate([cos_padding, cos_freq], axis=-1)
+        sin_freq = torch.concatenate([sin_padding, sin_freq], axis=-1)
+
+    B, T, half_HD = cos_freq.shape
+
+    cos_freq = cos_freq.reshape(B, T, num_attention_heads, half_HD // num_attention_heads)
+    sin_freq = sin_freq.reshape(B, T, num_attention_heads, half_HD // num_attention_heads)
+
+    cos_freq = torch.swapaxes(cos_freq, 1, 2)
+    sin_freq = torch.swapaxes(sin_freq, 1, 2)
+    return cos_freq, sin_freq
+
 class LTXBaseModel(torch.nn.Module, ABC):
     """
     Abstract base class for LTX models (Lightricks Transformer models).
