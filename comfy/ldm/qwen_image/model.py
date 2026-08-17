@@ -20,7 +20,10 @@ class GELU(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = self.proj(hidden_states)
-        hidden_states = F.gelu(hidden_states, approximate=self.approximate)
+        if hidden_states.device.type == "mps":
+            hidden_states = F.gelu(hidden_states.float(), approximate=self.approximate).to(dtype=hidden_states.dtype)
+        else:
+            hidden_states = F.gelu(hidden_states, approximate=self.approximate)
         return hidden_states
 
 
@@ -255,6 +258,9 @@ class QwenImageTransformerBlock(nn.Module):
 
     def _modulate(self, x: torch.Tensor, mod_params: torch.Tensor, timestep_zero_index=None) -> Tuple[torch.Tensor, torch.Tensor]:
         shift, scale, gate = torch.chunk(mod_params, 3, dim=-1)
+        mps = x.device.type == "mps"
+        if mps:
+            shift, scale = shift.float(), scale.float()
         if timestep_zero_index is not None:
             actual_batch = shift.size(0) // 2
             shift, shift_0 = shift[:actual_batch], shift[actual_batch:]
@@ -262,9 +268,11 @@ class QwenImageTransformerBlock(nn.Module):
             gate, gate_0 = gate[:actual_batch], gate[actual_batch:]
             reg = torch.addcmul(shift.unsqueeze(1), x[:, :timestep_zero_index], 1 + scale.unsqueeze(1))
             zero = torch.addcmul(shift_0.unsqueeze(1), x[:, timestep_zero_index:], 1 + scale_0.unsqueeze(1))
-            return torch.cat((reg, zero), dim=1), (gate.unsqueeze(1), gate_0.unsqueeze(1))
+            result = torch.cat((reg, zero), dim=1)
+            return (result.to(dtype=x.dtype) if mps else result), (gate.unsqueeze(1), gate_0.unsqueeze(1))
         else:
-            return torch.addcmul(shift.unsqueeze(1), x, 1 + scale.unsqueeze(1)), gate.unsqueeze(1)
+            result = torch.addcmul(shift.unsqueeze(1), x, 1 + scale.unsqueeze(1))
+            return (result.to(dtype=x.dtype) if mps else result), gate.unsqueeze(1)
 
     def forward(
         self,
@@ -334,7 +342,11 @@ class LastLayer(nn.Module):
     def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
         emb = self.linear(self.silu(conditioning_embedding))
         scale, shift = torch.chunk(emb, 2, dim=1)
-        x = torch.addcmul(shift[:, None, :], self.norm(x), (1 + scale)[:, None, :])
+        if x.device.type == "mps":
+            scale, shift = scale.float(), shift.float()
+            x = torch.addcmul(shift[:, None, :], self.norm(x), (1 + scale)[:, None, :]).to(dtype=x.dtype)
+        else:
+            x = torch.addcmul(shift[:, None, :], self.norm(x), (1 + scale)[:, None, :])
         return x
 
 

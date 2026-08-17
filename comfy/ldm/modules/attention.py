@@ -407,14 +407,17 @@ def attention_split(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     # print("steps", steps, mem_required, mem_free_total, modifier, q.element_size(), tensor_size)
     first_op_done = False
     cleared_cache = False
+    k_upcast = None
     while True:
         try:
             slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
+            if upcast and k_upcast is None:
+                k_upcast = k.float()
             for i in range(0, q.shape[1], slice_size):
                 end = i + slice_size
                 if upcast:
                     with torch.autocast(enabled=False, device_type = 'cuda'):
-                        s1 = einsum('b i d, b j d -> b i j', q[:, i:end].float(), k.float()) * scale
+                        s1 = einsum('b i d, b j d -> b i j', q[:, i:end].float(), k_upcast) * scale
                 else:
                     s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k) * scale
 
@@ -427,7 +430,7 @@ def attention_split(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
                         else:
                             s1 += mask[:, i:end]
 
-                s2 = s1.softmax(dim=-1).to(v.dtype)
+                s2 = s1.softmax(dim=-1, dtype=torch.float32).to(v.dtype)
                 del s1
                 first_op_done = True
 
@@ -543,6 +546,8 @@ else:
 
 @wrap_attn
 def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    attn_precision = get_attn_precision(attn_precision, q.dtype)
+
     if skip_reshape:
         b, _, _, dim_head = q.shape
     else:
@@ -550,6 +555,12 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
         dim_head //= heads
         q, k, v = _reshape_qkv_to_heads(q, k, v, b, heads, dim_head, kwargs.get("enable_gqa", False), expand_kv=False)
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
+
+    upcast = attn_precision == torch.float32 and q.dtype != torch.float32
+    if upcast:
+        q = q.float()
+        k = k.float()
+        v = v.float()
 
     if mask is not None:
         # add a batch dimension if there isn't already one
@@ -562,11 +573,13 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
     sdpa_keys = ("scale", "enable_gqa")
     sdpa_extra = {k: v for k, v in kwargs.items() if k in sdpa_keys}
 
+    orig_dtype = v.dtype
+
     if SDP_BATCH_LIMIT >= b:
         out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, **sdpa_extra)
         if not skip_output_reshape:
             out = (
-                out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+                out.transpose(1, 2).reshape(b, -1, heads * dim_head).to(orig_dtype)
             )
     else:
         out = torch.empty((b, q.shape[2], heads * dim_head), dtype=q.dtype, layout=q.layout, device=q.device)
@@ -583,6 +596,9 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
                 attn_mask=m,
                 dropout_p=0.0, is_causal=False, **sdpa_extra
             ).transpose(1, 2).reshape(-1, q.shape[2], heads * dim_head)
+
+    if upcast:
+        out = out.to(orig_dtype)
     return out
 
 def _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, enable_gqa):

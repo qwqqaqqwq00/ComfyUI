@@ -273,7 +273,10 @@ class PixArtAlphaTextProjection(nn.Module):
 
     def forward(self, caption):
         hidden_states = self.linear_1(caption)
-        hidden_states = self.act_1(hidden_states)
+        if hidden_states.device.type == "mps":
+            hidden_states = self.act_1(hidden_states.float()).to(dtype=hidden_states.dtype)
+        else:
+            hidden_states = self.act_1(hidden_states)
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
@@ -308,7 +311,10 @@ class GELU_approx(nn.Module):
         self.proj = operations.Linear(dim_in, dim_out, bias=bias, dtype=dtype, device=device)
 
     def forward(self, x):
-        return torch.nn.functional.gelu(self.proj(x), approximate="tanh")
+        x = self.proj(x)
+        if x.device.type == "mps":
+            return torch.nn.functional.gelu(x.float(), approximate="tanh").to(dtype=x.dtype)
+        return torch.nn.functional.gelu(x, approximate="tanh")
 
 
 class FeedForward(nn.Module):
@@ -546,12 +552,17 @@ class BasicTransformerBlock(nn.Module):
     def forward(self, x, context=None, attention_mask=None, timestep=None, pe=None, transformer_options={}, self_attention_mask=None, prompt_timestep=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None, None, :6].to(device=x.device, dtype=x.dtype) + timestep.reshape(x.shape[0], timestep.shape[1], self.scale_shift_table.shape[0], -1)[:, :, :6, :]).unbind(dim=2)
 
-        if comfy.model_management.in_training:
-            norm_x = comfy.ldm.common_dit.rms_norm(x) * (1 + scale_msa) + shift_msa
+        if x.device.type == "mps":
+            scale_msa, shift_msa, gate_msa = [t.float() for t in (scale_msa, shift_msa, gate_msa)]
+            x_fp32 = x.float()
+            attn_out = self.attn1(comfy.ldm.common_dit.rms_norm(x_fp32) * (1 + scale_msa) + shift_msa, pe=pe, mask=self_attention_mask, transformer_options=transformer_options) * gate_msa
+            x = (x_fp32 + attn_out).to(dtype=x.dtype)
         else:
-            norm_x = comfy.quant_ops.ck.rms_adaln(x, scale_msa, shift_msa)
-
-        x += self.attn1(norm_x, pe=pe, mask=self_attention_mask, transformer_options=transformer_options) * gate_msa
+            if comfy.model_management.in_training:
+                norm_x = comfy.ldm.common_dit.rms_norm(x) * (1 + scale_msa) + shift_msa
+            else:
+                norm_x = comfy.quant_ops.ck.rms_adaln(x, scale_msa, shift_msa)
+            x += self.attn1(norm_x, pe=pe, mask=self_attention_mask, transformer_options=transformer_options) * gate_msa
 
         if self.cross_attention_adaln:
             shift_q_mca, scale_q_mca, gate_mca = (self.scale_shift_table[None, None, 6:9].to(device=x.device, dtype=x.dtype) + timestep.reshape(x.shape[0], timestep.shape[1], self.scale_shift_table.shape[0], -1)[:, :, 6:9, :]).unbind(dim=2)
@@ -562,9 +573,16 @@ class BasicTransformerBlock(nn.Module):
         else:
             x += self.attn2(x, context=context, mask=attention_mask, transformer_options=transformer_options)
 
-        y = comfy.ldm.common_dit.rms_norm(x)
-        y = torch.addcmul(y, y, scale_mlp).add_(shift_mlp)
-        x.addcmul_(self.ff(y), gate_mlp)
+        if x.device.type == "mps":
+            scale_mlp_f, shift_mlp_f, gate_mlp_f = [t.float() for t in (scale_mlp, shift_mlp, gate_mlp)]
+            y_f32 = comfy.ldm.common_dit.rms_norm(x.float())
+            y_f32 = torch.addcmul(y_f32, y_f32, scale_mlp_f).add_(shift_mlp_f)
+            y = self.ff(y_f32.to(dtype=x.dtype))
+            x.addcmul_(y, gate_mlp_f.to(dtype=x.dtype))
+        else:
+            y = comfy.ldm.common_dit.rms_norm(x)
+            y = torch.addcmul(y, y, scale_mlp).add_(shift_mlp)
+            x.addcmul_(self.ff(y), gate_mlp)
 
         return x
 

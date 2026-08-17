@@ -71,6 +71,17 @@ class YakMLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
+class MPSGELU(nn.Module):
+    """GELU with MPS fp32 cast to avoid Metal fused kernel NaN bug (|x|>=12)."""
+    def __init__(self, approximate="tanh"):
+        super().__init__()
+        self.approximate = approximate
+    def forward(self, x):
+        if x.device.type == "mps":
+            return nn.functional.gelu(x.float(), approximate=self.approximate).to(dtype=x.dtype)
+        return nn.functional.gelu(x, approximate=self.approximate)
+
+
 def build_mlp(hidden_size, mlp_hidden_dim, mlp_silu_act=False, yak_mlp=False, dtype=None, device=None, operations=None):
     if yak_mlp:
         return YakMLP(hidden_size, mlp_hidden_dim, dtype=dtype, device=device, operations=operations)
@@ -83,8 +94,7 @@ def build_mlp(hidden_size, mlp_hidden_dim, mlp_silu_act=False, yak_mlp=False, dt
     else:
         return nn.Sequential(
             operations.Linear(hidden_size, mlp_hidden_dim, bias=True, dtype=dtype, device=device),
-            nn.GELU(approximate="tanh"),
-            operations.Linear(mlp_hidden_dim, hidden_size, bias=True, dtype=dtype, device=device),
+            MPSGELU(approximate="tanh"),
         )
 
 
@@ -130,6 +140,9 @@ class Modulation(nn.Module):
             vec = vec[:, None, :]
         out = self.lin(nn.functional.silu(vec)).chunk(self.multiplier, dim=-1)
 
+        if vec.device.type == "mps":
+            out = [o.float() for o in out]
+
         return (
             ModulationOut(*out[:3]),
             ModulationOut(*out[3:]) if self.is_double else None,
@@ -137,17 +150,25 @@ class Modulation(nn.Module):
 
 
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
+    orig_dtype = tensor.dtype
+    mps = tensor.device.type == "mps"
+    if mps:
+        tensor = tensor.float()
+        m_mult = m_mult.float()
+        if m_add is not None:
+            m_add = m_add.float()
     if modulation_dims is None:
         if m_add is not None:
-            return torch.addcmul(m_add, tensor, m_mult)
+            result = torch.addcmul(m_add, tensor, m_mult)
         else:
-            return tensor * m_mult
+            result = tensor * m_mult
     else:
         for d in modulation_dims:
             tensor[:, d[0]:d[1]] *= m_mult[:, d[2]:d[2] + 1]
             if m_add is not None:
                 tensor[:, d[0]:d[1]] += m_add[:, d[2]:d[2] + 1]
-        return tensor
+        result = tensor
+    return result.to(dtype=orig_dtype) if mps else result
 
 
 class SiLUActivation(nn.Module):
@@ -292,7 +313,7 @@ class SingleStreamBlock(nn.Module):
             self.mlp_hidden_dim_first = int(hidden_size * mlp_ratio * 2)
             self.mlp_act = SiLUActivation()
         else:
-            self.mlp_act = nn.GELU(approximate="tanh")
+            self.mlp_act = MPSGELU(approximate="tanh")
 
         if self.yak_mlp:
             self.mlp_hidden_dim_first *= 2

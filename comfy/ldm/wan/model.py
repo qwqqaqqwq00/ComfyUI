@@ -176,11 +176,22 @@ def repeat_e(e, x):
         return torch.repeat_interleave(e, repeats + 1, dim=1)[:, :x.size(1)]
 
 
-class WanFeedForward(nn.Sequential):
-    """[Linear, GELU(tanh), Linear], with the GELU folded into the down-projection."""
-
+class MPSGELU(nn.Module):
+    """GELU with MPS fp32 cast to avoid Metal fused kernel NaN bug (|x|>=12)."""
+    def __init__(self, approximate='tanh'):
+        super().__init__()
+        self.approximate = approximate
     def forward(self, x):
-        return comfy.ops.linear_input_act(self[2], self[0](x), "gelu_tanh")
+        if x.device.type == "mps":
+            return nn.functional.gelu(x.float(), approximate=self.approximate).to(dtype=x.dtype)
+        return nn.functional.gelu(x, approximate=self.approximate)
+
+
+def _adaln(shift, x, scale):
+    """AdaLN: shift + x * (1 + scale), MPS fp32-safe (avoids (1+scale) catastrophic cancellation)."""
+    if x.device.type == "mps":
+        return torch.addcmul(shift.float(), x.float(), 1.0 + scale.float()).to(dtype=x.dtype)
+    return torch.addcmul(shift, x, 1 + scale)
 
 
 class WanAttentionBlock(nn.Module):
@@ -216,8 +227,8 @@ class WanAttentionBlock(nn.Module):
                                                                       qk_norm,
                                                                       eps, operation_settings=operation_settings)
         self.norm2 = operation_settings.get("operations").LayerNorm(dim, eps, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.ffn = WanFeedForward(
-            operation_settings.get("operations").Linear(dim, ffn_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), nn.GELU(approximate='tanh'),
+        self.ffn = nn.Sequential(
+            operation_settings.get("operations").Linear(dim, ffn_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), MPSGELU(approximate='tanh'),
             operation_settings.get("operations").Linear(ffn_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
 
         # modulation
@@ -251,7 +262,7 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         x = x.contiguous() # otherwise implicit in LayerNorm
         y = self.self_attn(
-            torch.addcmul(repeat_e(e[0], x), self.norm1(x), 1 + repeat_e(e[1], x)),
+            _adaln(repeat_e(e[0], x), self.norm1(x), repeat_e(e[1], x)),
             freqs, transformer_options=transformer_options)
 
         x = torch.addcmul(x, y, repeat_e(e[2], x))
@@ -264,7 +275,7 @@ class WanAttentionBlock(nn.Module):
             for p in patches["attn2_patch"]:
                 x = p({"x": x, "transformer_options": transformer_options})
 
-        y = self.ffn(torch.addcmul(repeat_e(e[3], x), self.norm2(x), 1 + repeat_e(e[4], x)))
+        y = self.ffn(_adaln(repeat_e(e[3], x), self.norm2(x), repeat_e(e[4], x)))
         x = torch.addcmul(x, y, repeat_e(e[5], x))
         return x
 
@@ -380,7 +391,7 @@ class Head(nn.Module):
         else:
             e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device).unsqueeze(0) + e.unsqueeze(2)).unbind(2)
 
-        x = (self.head(torch.addcmul(repeat_e(e[0], x), self.norm(x), 1 + repeat_e(e[1], x))))
+        x = (self.head(_adaln(repeat_e(e[0], x), self.norm(x), repeat_e(e[1], x))))
         return x
 
 
@@ -498,7 +509,7 @@ class WanModel(torch.nn.Module):
         self.patch_embedding = operations.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size, device=operation_settings.get("device"), dtype=torch.float32)
         self.text_embedding = nn.Sequential(
-            operations.Linear(text_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), nn.GELU(approximate='tanh'),
+            operations.Linear(text_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), MPSGELU(approximate='tanh'),
             operations.Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
 
         self.time_embedding = nn.Sequential(
@@ -1523,7 +1534,7 @@ class WanAttentionBlockAudio(WanAttentionBlock):
 
         # self-attention
         y = self.self_attn(
-            torch.addcmul(repeat_e(e[0], x), self.norm1(x), 1 + repeat_e(e[1], x)),
+            _adaln(repeat_e(e[0], x), self.norm1(x), repeat_e(e[1], x)),
             freqs, transformer_options=transformer_options)
 
         x = torch.addcmul(x, y, repeat_e(e[2], x))
@@ -1532,7 +1543,7 @@ class WanAttentionBlockAudio(WanAttentionBlock):
         x = x + self.cross_attn(self.norm3(x), context, context_img_len=context_img_len, transformer_options=transformer_options)
         if audio is not None:
             x = self.audio_cross_attn_wrapper(x, audio, transformer_options=transformer_options)
-        y = self.ffn(torch.addcmul(repeat_e(e[3], x), self.norm2(x), 1 + repeat_e(e[4], x)))
+        y = self.ffn(_adaln(repeat_e(e[3], x), self.norm2(x), repeat_e(e[4], x)))
         x = torch.addcmul(x, y, repeat_e(e[5], x))
         return x
 

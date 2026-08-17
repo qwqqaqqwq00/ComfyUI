@@ -385,7 +385,7 @@ except AttributeError:
 def is_oom(e):
     if isinstance(e, OOM_EXCEPTION):
         return True
-    if isinstance(e, ACCELERATOR_ERROR) and (getattr(e, 'error_code', None) == 2 or "out of memory" in str(e).lower()):
+    if isinstance(e, ACCELERATOR_ERROR) and (getattr(e, 'error_code', None) == 2 or "out of memory" in str(e).lower() or "invalid buffer size" in str(e).lower()):
         discard_cuda_async_error()
         return True
     return False
@@ -2037,7 +2037,9 @@ def lora_compute_dtype(device):
 def synchronize():
     if cpu_mode():
         return
-    if is_intel_xpu():
+    if cpu_state == CPUState.MPS:
+        torch.mps.synchronize()
+    elif is_intel_xpu():
         torch.xpu.synchronize()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -2047,6 +2049,7 @@ def soft_empty_cache(force=False):
         return
     global cpu_state
     if cpu_state == CPUState.MPS:
+        torch.mps.synchronize()
         torch.mps.empty_cache()
     elif is_intel_xpu():
         torch.xpu.synchronize()
