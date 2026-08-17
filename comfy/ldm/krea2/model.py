@@ -45,6 +45,17 @@ class QKNorm(nn.Module):
         return self.qnorm(q), self.knorm(k)
 
 
+class MPSGELU(nn.Module):
+    """GELU with MPS fp32 cast to avoid Metal fused kernel NaN bug (|x|>=12)."""
+    def __init__(self, approximate="tanh"):
+        super().__init__()
+        self.approximate = approximate
+    def forward(self, x):
+        if x.device.type == "mps":
+            return nn.functional.gelu(x.float(), approximate=self.approximate).to(dtype=x.dtype)
+        return nn.functional.gelu(x, approximate=self.approximate)
+
+
 class SwiGLU(nn.Module):
     def __init__(self, features: int, multiplier: int, bias: bool = False, multiple: int = 128,
                  device=None, dtype=None, operations=None):
@@ -175,6 +186,11 @@ class SingleStreamBlock(nn.Module):
 
     def forward(self, x, vec, freqs, mask=None, timestep_zero_index=None, transformer_options={}):
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
+        mps = x.device.type == "mps"
+        orig_dtype = x.dtype
+        if mps:
+            prescale, preshift, pregate, postscale, postshift, postgate = [t.float() for t in (prescale, preshift, pregate, postscale, postshift, postgate)]
+            x = x.float()
         if timestep_zero_index is not None:
             bs = x.shape[0]
             ref_prescale = prescale[bs:]
@@ -195,6 +211,8 @@ class SingleStreamBlock(nn.Module):
             pre[:, timestep_zero_index:].mul_(1 + ref_prescale).add_(ref_preshift)
             attn = self.attn(pre, freqs, mask, transformer_options=transformer_options)
             del pre
+            if mps:
+                attn = attn.float()
             attn[:, :timestep_zero_index].mul_(pregate)
             attn[:, timestep_zero_index:].mul_(ref_pregate)
             x = x + attn
@@ -205,14 +223,20 @@ class SingleStreamBlock(nn.Module):
             post[:, timestep_zero_index:].mul_(1 + ref_postscale).add_(ref_postshift)
             mlp = self.mlp(post)
             del post
+            if mps:
+                mlp = mlp.float()
             mlp[:, :timestep_zero_index].mul_(postgate)
             mlp[:, timestep_zero_index:].mul_(ref_postgate)
             x = x + mlp
             del mlp
+            if mps:
+                x = x.to(dtype=orig_dtype)
             return x
 
         x = x + pregate * self.attn((1 + prescale) * self.prenorm(x) + preshift, freqs, mask, transformer_options=transformer_options)
         x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+        if mps:
+            x = x.to(dtype=orig_dtype)
         return x
 
 
@@ -225,7 +249,11 @@ class LastLayer(nn.Module):
 
     def forward(self, x, tvec):
         scale, shift = self.modulation(tvec)
-        x = (1 + scale) * self.norm(x) + shift
+        if x.device.type == "mps":
+            scale, shift = scale.float(), shift.float()
+            x = ((1 + scale) * self.norm(x.float()) + shift).to(dtype=x.dtype)
+        else:
+            x = (1 + scale) * self.norm(x) + shift
         return self.linear(x)
 
 
@@ -256,7 +284,7 @@ class SingleStreamDiT(nn.Module):
         ])
         self.tmlp = nn.Sequential(
             operations.Linear(tdim, features, device=device, dtype=dtype),
-            nn.GELU(approximate="tanh"),
+            MPSGELU(approximate="tanh"),
             operations.Linear(features, features, device=device, dtype=dtype),
         )
         self.txtfusion = TextFusionTransformer(txtlayers, txtdim, txtheads, multiplier, bias, txtkvheads,
@@ -264,12 +292,12 @@ class SingleStreamDiT(nn.Module):
         self.txtmlp = nn.Sequential(
             RMSNorm(txtdim, device=device, dtype=dtype, operations=operations),
             operations.Linear(txtdim, features, device=device, dtype=dtype),
-            nn.GELU(approximate="tanh"),
+            MPSGELU(approximate="tanh"),
             operations.Linear(features, features, device=device, dtype=dtype),
         )
         self.last = LastLayer(features, patch, channels, device=device, dtype=dtype, operations=operations)
         self.tproj = nn.Sequential(
-            nn.GELU(approximate="tanh"),
+            MPSGELU(approximate="tanh"),
             operations.Linear(features, features * 6, device=device, dtype=dtype),
         )
 
