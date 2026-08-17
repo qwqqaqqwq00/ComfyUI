@@ -388,6 +388,10 @@ def is_oom(e):
     if isinstance(e, ACCELERATOR_ERROR) and (getattr(e, 'error_code', None) == 2 or "out of memory" in str(e).lower() or "invalid buffer size" in str(e).lower()):
         discard_cuda_async_error()
         return True
+    if isinstance(e, RuntimeError) and "larger than int_max" in str(e).lower():
+        # MPSGraph cannot build tensors with dims > INT_MAX (e.g. hw*hw attention matrix
+        # for large images). Treat as OOM so slice_attention's chunking retry kicks in.
+        return True
     return False
 
 def raise_non_oom(e):
