@@ -950,7 +950,7 @@ def _swiglu_eager(x):
 
 
 INPUT_ACT_EAGER = {
-    "gelu_tanh": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
+    "gelu_tanh": lambda x: torch.nn.functional.gelu(x.float(), approximate="tanh").to(dtype=x.dtype) if x.device.type == "mps" else torch.nn.functional.gelu(x, approximate="tanh"),
     "swiglu": _swiglu_eager,
 }
 
