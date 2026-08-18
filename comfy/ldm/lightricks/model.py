@@ -623,6 +623,13 @@ def apply_cross_attention_adaln(
         prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
         + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
     ).unbind(dim=2)
+    if x.device.type == "mps":
+        q_shift, q_scale, q_gate = [t.float() for t in (q_shift, q_scale, q_gate)]
+        shift_kv, scale_kv = shift_kv.float(), scale_kv.float()
+        attn_input = comfy.ldm.common_dit.rms_norm(x.float()) * (1 + q_scale) + q_shift
+        encoder_hidden_states = context.float() * (1 + scale_kv) + shift_kv
+        attn_out = attn(attn_input, context=encoder_hidden_states, mask=attention_mask, transformer_options=transformer_options)
+        return (attn_out * q_gate).to(dtype=x.dtype)
     if comfy.model_management.in_training:
         attn_input = comfy.ldm.common_dit.rms_norm(x) * (1 + q_scale) + q_shift
     else:
@@ -1475,7 +1482,11 @@ class LTXVModel(LTXBaseModel):
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         x = self.norm_out(x)
-        x = x * (1 + scale) + shift
+        if x.device.type == "mps":
+            scale, shift = scale.float(), shift.float()
+            x = (x.float() * (1 + scale) + shift).to(dtype=x.dtype)
+        else:
+            x = x * (1 + scale) + shift
         x = self.proj_out(x)
 
         if keyframe_idxs is not None and keyframe_idxs.shape[2] > 0:
