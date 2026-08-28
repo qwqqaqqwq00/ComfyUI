@@ -214,6 +214,10 @@ class AdalnProj(nn.Module):
 
 def _mod_scale_shift(h, shift, scale, segments):
     # segments: [(start, stop, mod_row)] covering h contiguously.
+    if h.device.type == "mps":
+        for a, b, row in segments:
+            h[a:b] = (h[a:b].float() * (1.0 + scale[row].float()) + shift[row].float()).to(h.dtype)
+        return h
     for a, b, row in segments:
         h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
     return h
@@ -292,8 +296,12 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaln_proj(t_emb)
         va, vb, vrow = video_seg
         aa, ab, arow = audio_seg
-        hv = (self.norm(x[va:vb]) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
-        ha = (self.norm(x[aa:ab]) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
+        if x.device.type == "mps":
+            hv = self.norm(x[va:vb]).float() * (1.0 + scale[vrow].float()) + shift[vrow].float()
+            ha = self.norm(x[aa:ab]).float() * (1.0 + scale[arow].float()) + shift[arow].float()
+        else:
+            hv = (self.norm(x[va:vb]) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
+            ha = (self.norm(x[aa:ab]) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
         return self.video_out(hv), self.audio_out(ha)
 
 
