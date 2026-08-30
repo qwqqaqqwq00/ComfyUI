@@ -214,10 +214,6 @@ class AdalnProj(nn.Module):
 
 def _mod_scale_shift(h, shift, scale, segments):
     # segments: [(start, stop, mod_row)] covering h contiguously.
-    if h.device.type == "mps":
-        for a, b, row in segments:
-            h[a:b] = (h[a:b].float() * (1.0 + scale[row].float()) + shift[row].float()).to(h.dtype)
-        return h
     for a, b, row in segments:
         h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
     return h
@@ -225,10 +221,6 @@ def _mod_scale_shift(h, shift, scale, segments):
 
 def _mod_gate(x, gate, other, segments):
     # other is the fresh attn/mlp output: accumulate the gated residual into the stream in place, one fused kernel per segment
-    if x.device.type == "mps":
-        for a, b, row in segments:
-            x[a:b] = (x[a:b].float() + other[a:b].float() * gate[row].float()).to(x.dtype)
-        return x
     for a, b, row in segments:
         x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
     return x
@@ -300,12 +292,8 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaln_proj(t_emb)
         va, vb, vrow = video_seg
         aa, ab, arow = audio_seg
-        if x.device.type == "mps":
-            hv = self.norm(x[va:vb]).float() * (1.0 + scale[vrow].float()) + shift[vrow].float()
-            ha = self.norm(x[aa:ab]).float() * (1.0 + scale[arow].float()) + shift[arow].float()
-        else:
-            hv = (self.norm(x[va:vb]) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
-            ha = (self.norm(x[aa:ab]) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
+        hv = (self.norm(x[va:vb]) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
+        ha = (self.norm(x[aa:ab]) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
         return self.video_out(hv), self.audio_out(ha)
 
 
@@ -625,10 +613,7 @@ class MiniMaxH3Model(nn.Module):
                                              transformer_options=transformer_options)
 
         # segments are contiguous: assemble by slices, embed rows follow segment order
-        # H3's gated intermediates run to ~1.4e3 even though the final streams are small;
-        # fp16 quantizes those to integer precision and 50 residual accumulations diverge
-        # on MPS (CPU fp32 reference is clean). Keep the residual stream fp32 on MPS.
-        h = torch.empty(layout.seq_len, self.hidden_size, dtype=torch.float32 if device.type == "mps" else dtype, device=device)
+        h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
         voff = aoff = 0
         for a, b, kind in layout.segments:
             n = b - a
@@ -649,16 +634,10 @@ class MiniMaxH3Model(nn.Module):
             i0 = pos.floor().long().clamp(max=table.shape[0] - 2)   # lower grid row, max-clamp keeps t=1.0 on the last interval instead of reading past the table
             t_emb = torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))  # blend the two rows by the fractional part
         else:
-            t_emb = self.time_embedder(t_vals)
-            if device.type == "mps":
-                # keep the modulation embeddings fp32 on MPS: the adaln projections are tiny
-                # (t_emb rows are the packed streams' timesteps) and their fp16 rounding feeds
-                # every block's scale/shift/gate, which the per-segment modulation reuses
-                t_emb = t_emb.float()
+            t_emb = self.time_embedder(t_vals).to(dtype)
 
         # rotation table computed once per forward, consumed by the kitchen split-half rope
-        # rotation table matches the stream dtype (fp32 on MPS with the fp32 residual stream)
-        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), h.dtype)
+        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
 
         # blocks
         patches_replace = transformer_options.get("patches_replace", {})
